@@ -6,7 +6,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from engine import AIRPORTS, money, normalize, compare, flight_board
-from providers import CATALOG, presets, search, validate_provider
+from providers import CATALOG, presets, search, validate_provider, variflight
 import airports
 from runtime import bind_server
 
@@ -44,7 +44,7 @@ def config():
 
 def install_provider_presets():
     """One-time, additive migration. Preserve all existing sources and credentials."""
-    marker=DATA/'providers-v2.json'
+    marker=DATA/'providers-v3.json'
     if marker.exists(): return
     cfg=config()
     for p in presets():
@@ -94,10 +94,13 @@ def demo(m):
     return [normalize(o,'演示数据 · 非真实票价',[]) for o in [direct,a,b,through]]
 
 class OfferBatch(list):
-    def __init__(self,values,hints):
-        super().__init__(values); self.hints=hints
+    def __init__(self,values,hints,schedules=None):
+        super().__init__(values); self.hints=hints;self.schedules=schedules or []
 
 def fetch(provider,m):
+    if provider.get('kind')=='variflight':
+        schedules,hints=variflight(provider,m)
+        return OfferBatch([],hints,schedules)
     values,hints=search(provider,m)
     return OfferBatch(values,hints)
 
@@ -120,7 +123,7 @@ def send_mail(cfg,recipient,subject,body):
         client.send_message(message)
 
 def collect(m,cfg):
-    offers=[];errors=[];candidates=[];hints=[]
+    offers=[];errors=[];candidates=[];hints=[];schedules=[]
     if m['date_to']<date.today().isoformat():raise ValueError('出发日期已过期，请重新选择')
     if m['demo']: offers=demo(m)
     else:
@@ -128,7 +131,7 @@ def collect(m,cfg):
         if not providers:raise ValueError('待配置：尚未启用真实票价接口')
         for p in providers:
             try:
-                raw=fetch(p,m);hints.extend(getattr(raw,'hints',[]))
+                raw=fetch(p,m);hints.extend(getattr(raw,'hints',[]));schedules.extend(getattr(raw,'schedules',[]))
                 for o in raw:
                     try:
                         if o.get('price_status')=='unverified':candidates.append(candidate(o,p['name']))
@@ -138,7 +141,7 @@ def collect(m,cfg):
                 errors.append(p['name']+'：'+(str(e) if isinstance(e,ValueError) else '接口请求失败（'+type(e).__name__+'）'))
     result=compare(offers,m)
     result.update(demo=m['demo'],warnings=errors[:20],candidates=sorted(candidates,key=lambda x:x['display_price']),
-                  hints=sorted(set(hints)),flights=flight_board(offers,candidates,m),checked=time.time(),
+                  hints=sorted(set(hints)),flights=flight_board(offers,candidates,m,schedules),checked=time.time(),
                   coverage='仅覆盖已接入来源本轮返回的直飞航班，不是全市场完整时刻表。飞猪单次最多返回 10 条结果。')
     return result
 
@@ -224,6 +227,8 @@ class Handler(BaseHTTPRequestHandler):
                 p['has_token']=bool(p.get('token')); p['token']=''
                 p['health']=PROVIDER_HEALTH.get(p['name'])
             cfg['catalog']=CATALOG
+            cfg['fee_policy']={'scope':'中国大陆国内成人普通客票','effective_from':'2026-08-05','development_fund':50,'fuel_up_to_800km':40,'fuel_over_800km':70,
+                               'note':'按机场坐标自动计算距离；接口明确费用或含税总价优先，儿童/婴儿及特殊旅客需来源提供旅客类型。'}
             return self.respond(cfg)
         files={'/':'index.html','/app.js':'app.js','/style.css':'style.css','/explore.js':'explore.js'}
         if self.path not in files: return self.respond({'error':'未找到'},404)
@@ -294,7 +299,8 @@ class Handler(BaseHTTPRequestHandler):
                     for o in raw:
                         try: normalize(o,provider['name'],cfg['fee_rules']); usable+=1
                         except Exception: pending+=1
-                    health=dict(ok=True,checked=time.time(),message=f'查询成功：{len(raw)} 条匹配机场报价，{usable} 条含税价可用，{pending} 条费用待确认',hints=getattr(raw,'hints',[]))
+                    schedules=len(getattr(raw,'schedules',[]))
+                    health=dict(ok=True,checked=time.time(),message=(f'查询成功：{schedules} 条航班动态（不含票价）' if provider.get('kind')=='variflight' else f'查询成功：{len(raw)} 条匹配机场报价，{usable} 条含税价可用，{pending} 条费用待确认'),hints=getattr(raw,'hints',[]))
                 except Exception as e:
                     health=dict(ok=False,checked=time.time(),message=str(e) if isinstance(e,ValueError) else '连接失败（'+type(e).__name__+'）')
                 PROVIDER_HEALTH[provider['name']]=health

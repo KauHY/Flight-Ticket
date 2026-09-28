@@ -20,11 +20,12 @@ const {chromium}=require('playwright');
  if(await p.evaluate(()=>document.documentElement.scrollWidth>innerWidth))throw Error('Mobile overflow');
  await p.getByRole('button',{name:'⚙　数据与邮件'}).click();await p.getByRole('heading',{name:'连接你的数据源'}).waitFor();
  await p.getByRole('heading',{name:'飞猪 FlyAI',exact:true}).waitFor();
- if(await p.locator('.provider[data-kind="partner"] .p-enabled:disabled').count()!==5)throw Error('Partner source state incorrect');
- for(const kind of ['tongcheng','spring']){
+ if(await p.locator('.provider[data-kind="partner"] .p-enabled:disabled').count()<15)throw Error('Partner source catalog incomplete');
+ for(const kind of ['tongcheng','spring','variflight']){
   const row=p.locator(`.provider[data-kind="${kind}"]`);
   if(await row.count()!==1||await row.locator('.p-token,.p-endpoint').count())throw Error('Crawler source configuration incorrect');
  }
+ await p.getByText('已内置 2026-08-05 起成人国内标准',{exact:false}).waitFor();
  await p.getByRole('button',{name:'保存设置',exact:true}).click();
  await p.getByText('配置已保存',{exact:true}).waitFor();
  await p.screenshot({path:'test-results-providers.png',fullPage:true});

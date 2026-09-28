@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 from datetime import date,timedelta
 import app
-from providers import parse_flyai, validate_provider, presets, search
+from providers import parse_flyai, validate_provider, presets, search, local_env
 from engine import normalize
 
 class ProviderTests(unittest.TestCase):
@@ -45,6 +45,10 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(p['token'],'secret')
         p=validate_provider(dict(name='a',kind='flyai',endpoint='',token=''),old)
         self.assertEqual(p['token'],'')
+    def test_variflight_secret_not_in_catalog_or_presets(self):
+        source=next(p for p in presets() if p['kind']=='variflight')
+        self.assertFalse(source['enabled']);self.assertEqual(source['token'],'')
+        self.assertNotIn('APP_SECURITY',json.dumps(app.CATALOG))
     def test_migration_preserves_existing_and_runs_once(self):
         with tempfile.TemporaryDirectory() as tmp,patch.object(app,'DATA',Path(tmp)):
             existing={**app.DEFAULT,'providers':[dict(name='existing',endpoint='https://example.com',token='secret',enabled=True)]}

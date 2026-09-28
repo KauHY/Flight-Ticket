@@ -18,9 +18,16 @@ class FlightTests(unittest.TestCase):
     def test_no_double_tax(self):
         v=self.raw();v.update(taxes_included=True,total=410)
         self.assertEqual(normalize(v,'x',[])['total'],41000)
-    def test_unknown_fee_rejected(self):
+    def test_current_domestic_fee_automatic(self):
         v=self.raw();del v['segments'][0]['fuel_fee']
-        with self.assertRaises(ValueError):normalize(v,'x',[])
+        result=normalize(v,'x',[])
+        self.assertEqual(result['taxes'],12000)
+        self.assertIn('燃油 ¥70.00',result['breakdown'][0])
+    def test_domestic_short_band_and_regional_exemption(self):
+        v=self.raw();s=v['segments'][0];s.update(origin='PEK',destination='TSN');s.pop('airport_fee');s.pop('fuel_fee')
+        self.assertEqual(normalize(v,'x',[])['taxes'],9000)
+        s['regional_aircraft_exempt']=True
+        self.assertEqual(normalize(v,'x',[])['taxes'],4000)
     def test_connections_include_both_taxes(self):
         r=compare(app.demo(self.m),self.m)
         self.assertEqual(r['best_direct'],69000);self.assertEqual(r['best_connection'],56000)

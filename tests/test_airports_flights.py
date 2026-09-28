@@ -62,6 +62,12 @@ class AirportFlightTests(unittest.TestCase):
     def test_same_flight_different_airport_not_merged(self):
         offers=[normalize(self.raw(x),'source',[]) for x in ['SHA','PVG']]
         self.assertEqual(len(flight_board(offers,[],self.m)),2)
+    def test_status_source_adds_flight_without_fake_price(self):
+        raw=self.raw();segment=raw['segments'][0]
+        status=[dict(source='飞常准',status='计划',segments=[segment])]
+        rows=flight_board([],[],self.m,status)
+        self.assertEqual(len(rows),1);self.assertIsNone(rows[0]['total']);self.assertIsNone(rows[0]['display_price'])
+        self.assertEqual(rows[0]['quote_count'],0);self.assertEqual(rows[0]['status'],'计划')
     def test_on_demand_never_sends_mail(self):
         with patch.object(app,'send_mail') as mail:
             result=app.collect(self.m,app.DEFAULT)

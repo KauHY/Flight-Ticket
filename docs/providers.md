@@ -10,6 +10,13 @@
 | 东方航空 | 预配置，禁用；待 NDC 授权与协议适配 | [东航开放平台](https://developer.ceair.com/)要求卖家注册、完善公司资料、审核测试环境及生产上线 |
 | 南方航空 | 预配置，禁用；待 NDC 授权与协议适配 | [合作指南](https://www.csair.com/cn/czadscale/2019/20190521_8/index.html)、[查询接口说明](https://www.csair.com/cn/czadscale/2019/20190521_2/index.html)；指南较早，实际版本和商务条件需向南航确认 |
 | 厦门航空 | 预配置，禁用；待 NDC 授权与协议适配 | [NDC 21.3 官方文档](https://open.xiamenair.com/doc/zh/ndc-v213/1_General_Introduction.html)，需分销链、销售地和平台提供的接入资料 |
+| 飞常准 | 航班动态 V3 适配器已实现，默认禁用 | 只补充航班计划和运行状态，不是票价来源。凭据从忽略提交的 `.env` 读取；当前账号实测返回“暂无数据权限”，需飞常准开通 Flight Status Query V3 并确认公网 IP 白名单 |
+| Amadeus | 预配置，禁用；待 API 凭据 | [Flight Offers Search](https://developers.amadeus.com/self-service/category/flights/api-doc/flight-offers-search) |
+| Duffel | 预配置，禁用；待 API 凭据 | [Offer Requests](https://duffel.com/docs/api/offer-requests)；测试环境不代表真实市场价格 |
+| Skyscanner | 预配置，禁用；待合作方审批 | [Flights Live Prices](https://developers.skyscanner.net/docs/flights-live-prices/overview) |
+| Travelpayouts / Aviasales | 预配置，禁用；待联盟凭据 | [API 说明](https://support.travelpayouts.com/hc/en-us/articles/203956163) |
+
+设置页还预置了国航、海航、川航、山航、深航、吉祥、九元、成都航空、华夏、长龙、西藏航空和奥凯航空的官方入口。这些条目用于后续申请与跟踪接入条件，默认禁用；官网可购票不代表存在可合法、稳定调用的公开运价 API。
 
 国航及其他航司未配置未经证实的 API 地址。聚合源出现某航司航班不代表已经直连该航司官网，也不保证官网同价。
 
