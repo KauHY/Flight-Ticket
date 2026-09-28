@@ -11,6 +11,8 @@ from engine import normalize
 
 class ProviderTests(unittest.TestCase):
     def setUp(self):
+        import airports
+        airports.initialize()
         self.day=(date.today()+timedelta(days=7)).isoformat()
         self.m=dict(origin='SHA',destination='CAN',date_from=self.day,date_to=self.day,connections=True)
         self.item=dict(ticketPrice='380.00',jumpUrl='https://example.com/flight',journeys=[{'journeyType':'直达','segments':[
@@ -30,7 +32,7 @@ class ProviderTests(unittest.TestCase):
         self.item['journeys'][0]['segments'][0]['depStationCode']='PVG'
         self.assertEqual(parse_flyai(self.payload(),self.m),[])
     def test_unknown_timezone_not_guessed(self):
-        self.item['journeys'][0]['segments'][0]['arrStationCode']='NRT';self.m['destination']='NRT'
+        self.item['journeys'][0]['segments'][0]['arrStationCode']='ZZZ';self.m['destination']='ZZZ'
         self.assertEqual(parse_flyai(self.payload(),self.m),[])
     def test_cli_fake_success_rejected(self):
         with self.assertRaises(ValueError):parse_flyai({'tool':'search_flight','arguments':{}},self.m)

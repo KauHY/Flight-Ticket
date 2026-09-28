@@ -1,12 +1,14 @@
-import json, os, re, sqlite3, threading, time, ssl, smtplib, urllib.request, urllib.parse
+import json, os, re, sqlite3, threading, time, ssl, smtplib, urllib.request, urllib.parse, uuid
 from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from engine import AIRPORTS, money, normalize, compare
+from engine import AIRPORTS, money, normalize, compare, flight_board
 from providers import CATALOG, presets, search, validate_provider
+import airports
+from runtime import bind_server
 
 ROOT=Path(__file__).resolve().parent
 DATA=Path(os.environ.get('FLIGHT_DATA',str(ROOT/'data')))
@@ -16,6 +18,7 @@ LOCK=threading.Lock()
 POOL=ThreadPoolExecutor(max_workers=2)
 RUNNING=set()
 PROVIDER_HEALTH={}
+QUERIES={}
 DEFAULT={'providers':[], 'fee_rules':[], 'smtp':{'host':'','port':465,'security':'ssl','username':'','password':'','sender':''}}
 
 @contextmanager
@@ -28,6 +31,7 @@ def db():
         c.close()
 
 def init():
+    airports.initialize()
     with db() as c:
         c.executescript('''CREATE TABLE IF NOT EXISTS monitors(id INTEGER PRIMARY KEY, body TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, checked REAL DEFAULT 0, result TEXT, error TEXT);
         CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, monitor_id INTEGER, created REAL, kind TEXT, message TEXT);
@@ -40,7 +44,7 @@ def config():
 
 def install_provider_presets():
     """One-time, additive migration. Preserve all existing sources and credentials."""
-    marker=DATA/'providers-v1.json'
+    marker=DATA/'providers-v2.json'
     if marker.exists(): return
     cfg=config()
     for p in presets():
@@ -53,13 +57,20 @@ def event(mid,kind,message):
     with db() as c:
         c.execute('INSERT INTO events(monitor_id,created,kind,message) VALUES(?,?,?,?)',(mid,time.time(),kind,message))
 
-def validate_monitor(v):
-    origin=v['origin'].strip().upper(); dest=v['destination'].strip().upper()
-    if not re.fullmatch('[A-Z]{3}',origin) or not re.fullmatch('[A-Z]{3}',dest) or origin==dest:
-        raise ValueError('请选择不同的机场（三字码）')
+def validate_route(v):
+    origin=airports.resolve(v['origin']);dest=airports.resolve(v['destination'])
+    if set(origin['codes']) & set(dest['codes']):raise ValueError('始发和目的机场范围不能重叠')
     start=date.fromisoformat(v['date_from']); end=date.fromisoformat(v.get('date_to') or v['date_from'])
     if start<date.today() or end<start or (end-start).days>30:
         raise ValueError('日期须从今天起，区间最多 31 天')
+    count=len(origin['codes'])*len(dest['codes'])*((end-start).days+1)*(2 if v.get('connections',True) else 1)
+    if count>120:raise ValueError(f'当前选择需 {count} 次航线查询，超过单次 120 次限制；请缩小日期范围或选择具体机场')
+    return dict(origin=origin['id'],destination=dest['id'],origin_airports=origin['codes'],destination_airports=dest['codes'],
+                origin_label=origin['label'],destination_label=dest['label'],date_from=str(start),date_to=str(end),
+                connections=bool(v.get('connections',True)),self_transfer=bool(v.get('self_transfer',False)),demo=bool(v.get('demo',False)))
+
+def validate_monitor(v):
+    route=validate_route(v)
     email=v['email'].strip()
     if not re.fullmatch(r'[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+',email):
         raise ValueError('请输入有效提醒邮箱')
@@ -67,9 +78,12 @@ def validate_monitor(v):
     if target<=0: raise ValueError('目标价必须大于零')
     interval=int(v.get('interval',60))
     if not 15<=interval<=1440: raise ValueError('检查间隔应为 15–1440 分钟')
-    return dict(origin=origin,destination=dest,date_from=str(start),date_to=str(end),target=target,email=email,interval=interval,connections=bool(v.get('connections',True)),self_transfer=bool(v.get('self_transfer',False)),demo=bool(v.get('demo',False)))
+    return dict(**route,target=target,email=email,interval=interval)
 
 def demo(m):
+    if m['origin'].startswith('CITY:') or m['destination'].startswith('CITY:'):
+        return [o for a in airports.scope(m,'origin') for b in airports.scope(m,'destination')
+                for o in demo({**m,'origin':a,'destination':b,'origin_airports':[a],'destination_airports':[b]})]
     day=m['date_from']; hub=next(x for x in ['WUH','XIY','CKG'] if x not in (m['origin'],m['destination']))
     def leg(a,b,dep,arr,flight,base):
         return {'currency':'CNY','base_fare':base,'taxes_included':False,'segments':[{'origin':a,'destination':b,'departure':day+'T'+dep+':00+08:00','arrival':day+'T'+arr+':00+08:00','flight':flight,'carrier':'DEMO','airport_fee':50,'fuel_fee':60}]}
@@ -105,37 +119,46 @@ def send_mail(cfg,recipient,subject,body):
         if s.get('username'): client.login(s['username'],s['password'])
         client.send_message(message)
 
+def collect(m,cfg):
+    offers=[];errors=[];candidates=[];hints=[]
+    if m['date_to']<date.today().isoformat():raise ValueError('出发日期已过期，请重新选择')
+    if m['demo']: offers=demo(m)
+    else:
+        providers=[p for p in cfg['providers'] if p.get('enabled')]
+        if not providers:raise ValueError('待配置：尚未启用真实票价接口')
+        for p in providers:
+            try:
+                raw=fetch(p,m);hints.extend(getattr(raw,'hints',[]))
+                for o in raw:
+                    try:
+                        if o.get('price_status')=='unverified':candidates.append(candidate(o,p['name']))
+                        else:offers.append(normalize(o,p['name'],cfg['fee_rules']))
+                    except Exception as e:errors.append(p['name']+'：报价不可用（'+str(e)[:160]+'）')
+            except Exception as e:
+                errors.append(p['name']+'：'+(str(e) if isinstance(e,ValueError) else '接口请求失败（'+type(e).__name__+'）'))
+    result=compare(offers,m)
+    result.update(demo=m['demo'],warnings=errors[:20],candidates=sorted(candidates,key=lambda x:x['display_price']),
+                  hints=sorted(set(hints)),flights=flight_board(offers,candidates,m),checked=time.time(),
+                  coverage='仅覆盖已接入来源本轮返回的直飞航班，不是全市场完整时刻表。飞猪单次最多返回 10 条结果。')
+    return result
+
+def query_job(qid,m):
+    try:
+        result=collect(m,config())
+        with LOCK:QUERIES[qid].update(status='done',result=result)
+    except Exception as e:
+        with LOCK:QUERIES[qid].update(status='error',error=str(e)[:250])
+
 def run(mid):
     try:
         with db() as c: row=c.execute('SELECT * FROM monitors WHERE id=?',(mid,)).fetchone()
         if not row or not row['enabled']: return
-        m=json.loads(row['body']); cfg=config(); offers=[]; errors=[]; candidates=[]; hints=[]
-        if m['date_to']<date.today().isoformat():
-            raise ValueError('出发日期已过期，请新建监控')
-        if m['demo']: offers=demo(m)
-        else:
-            providers=[p for p in cfg['providers'] if p.get('enabled')]
-            if not providers: raise ValueError('待配置：尚未启用真实票价接口')
-            for p in providers:
-                try:
-                    raw=fetch(p,m)
-                    hints.extend(getattr(raw,'hints',[]))
-                    for o in raw:
-                        try:
-                            if o.get('price_status')=='unverified':
-                                candidates.append(candidate(o,p['name']))
-                            else: offers.append(normalize(o,p['name'],cfg['fee_rules']))
-                        except Exception as e: errors.append(p['name']+'：报价不可用（'+str(e)[:160]+'）')
-                except Exception as e:
-                    errors.append(p['name']+'：'+(str(e) if isinstance(e,ValueError) else '接口请求失败（'+type(e).__name__+'）'))
-        result=compare(offers,m); result['demo']=m['demo']; result['warnings']=errors[:20]
-        result['candidates']=sorted(candidates,key=lambda x:x['display_price'])[:60]
-        result['hints']=sorted(set(hints))
+        m=json.loads(row['body']);cfg=config();result=collect(m,cfg);errors=result['warnings']
         all_offers=sorted(result['direct']+result['connections'],key=lambda x:x['total'])
         with db() as c:
             c.execute('UPDATE monitors SET checked=?,result=?,error=? WHERE id=?',(time.time(),json.dumps(result,ensure_ascii=False),'；'.join(errors[:3]),mid))
             if all_offers: c.execute('INSERT INTO history(monitor_id,created,price,demo) VALUES(?,?,?,?)',(mid,time.time(),all_offers[0]['total'],m['demo']))
-        event(mid,'demo' if m['demo'] else 'check',f"检查完成：{len(result['direct'])} 个直飞 / {len(result['connections'])} 个转机方案 / {len(candidates)} 个费用待确认报价" + ('；存在接口或费用错误' if errors else ''))
+        event(mid,'demo' if m['demo'] else 'check',f"检查完成：{len(result['direct'])} 个直飞 / {len(result['connections'])} 个转机方案 / {len(result['candidates'])} 个费用待确认报价" + ('；存在接口或费用错误' if errors else ''))
         if m['demo']: return
         for o in all_offers[:1]:
             if o['total']>=m['target']: continue
@@ -180,13 +203,21 @@ class Handler(BaseHTTPRequestHandler):
         return self.headers.get('Host') in allowed and (not self.headers.get('Origin') or self.headers['Origin'] in {'http://'+x for x in allowed})
     def do_GET(self):
         if not self.trusted(): return self.respond({'error':'禁止跨站访问'},403)
+        if self.path=='/api/health':
+            return self.respond({'app':'flight-ticket-radar','status':'ready'})
+        if self.path.startswith('/api/airports?'):
+            params=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            return self.respond(dict(items=airports.search(params.get('q',[''])[0],all_records=params.get('all',['0'])[0]=='1'),stats=airports.stats()))
+        if self.path.startswith('/api/flights/'):
+            with LOCK:value=dict(QUERIES.get(self.path.split('/')[-1],{}))
+            return self.respond(value if value else {'error':'查询不存在或已过期'},200 if value else 404)
         if self.path=='/api/state':
             with db() as c:
                 rows=c.execute('SELECT * FROM monitors ORDER BY id DESC').fetchall()
                 monitors=[dict(id=r['id'],**json.loads(r['body']),enabled=bool(r['enabled']),checked=r['checked'],result=json.loads(r['result']) if r['result'] else None,error=r['error'],running=r['id'] in RUNNING) for r in rows]
                 events=[dict(r) for r in c.execute('SELECT * FROM events ORDER BY id DESC LIMIT 60')]
                 history=[dict(r) for r in c.execute('SELECT * FROM history ORDER BY id DESC LIMIT 500')]
-            return self.respond(dict(monitors=monitors,events=events,history=history,airports=AIRPORTS))
+            return self.respond(dict(monitors=monitors,events=events,history=history,airports=AIRPORTS,airport_stats=airports.stats()))
         if self.path=='/api/config':
             cfg=config(); cfg['smtp']['password']=''
             for p in cfg['providers']:
@@ -194,7 +225,7 @@ class Handler(BaseHTTPRequestHandler):
                 p['health']=PROVIDER_HEALTH.get(p['name'])
             cfg['catalog']=CATALOG
             return self.respond(cfg)
-        files={'/':'index.html','/app.js':'app.js','/style.css':'style.css'}
+        files={'/':'index.html','/app.js':'app.js','/style.css':'style.css','/explore.js':'explore.js'}
         if self.path not in files: return self.respond({'error':'未找到'},404)
         p=ROOT/'static'/files[self.path]; body=p.read_bytes(); self.send_response(200)
         self.send_header('Content-Type',{'html':'text/html; charset=utf-8','js':'text/javascript; charset=utf-8','css':'text/css; charset=utf-8'}[p.suffix[1:]])
@@ -206,6 +237,19 @@ class Handler(BaseHTTPRequestHandler):
             size=int(self.headers.get('Content-Length',0))
             if size>200000: raise ValueError('请求过大')
             v=json.loads(self.rfile.read(size))
+            if self.path=='/api/flights':
+                m=validate_route({**v,'connections':False,'self_transfer':False})
+                qid=uuid.uuid4().hex
+                with LOCK:
+                    for old in list(QUERIES):
+                        if QUERIES[old]['status']!='running' and time.time()-QUERIES[old]['created']>3600:del QUERIES[old]
+                    if sum(q['status']=='running' for q in QUERIES.values())>=2:raise ValueError('已有两项查询运行中，请等待完成')
+                    if len(QUERIES)>=30:
+                        old=next((k for k,x in QUERIES.items() if x['status']!='running'),None)
+                        if old:del QUERIES[old]
+                    QUERIES[qid]=dict(id=qid,status='running',created=time.time(),route=m)
+                POOL.submit(query_job,qid,m)
+                return self.respond({'id':qid},202)
             if self.path=='/api/monitors':
                 m=validate_monitor(v)
                 with db() as c: mid=c.execute('INSERT INTO monitors(body) VALUES(?)',(json.dumps(m,ensure_ascii=False),)).lastrowid
@@ -263,8 +307,25 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond({'error':'未找到'},404)
         except Exception as e: return self.respond({'error':str(e)[:250]},400)
 
+def main():
+    try:
+        port=int(os.environ.get('PORT','8765'))
+        if not 1<=port<=65535:raise ValueError('PORT 必须是 1–65535 的整数')
+        server=bind_server(Handler,port)
+        if server is None:return 0
+    except (ValueError,OSError) as e:
+        print(f'启动失败：{e}',flush=True);return 1
+    with server:
+        from zoneinfo import ZoneInfo,ZoneInfoNotFoundError
+        try:ZoneInfo('Asia/Shanghai')
+        except ZoneInfoNotFoundError:
+            print('当前 Python 缺少 tzdata 时区库。请运行 .\\start.ps1 使用项目虚拟环境，或安装 requirements.txt。',flush=True)
+            return 1
+        init(); install_provider_presets(); threading.Thread(target=scheduler,daemon=True).start()
+        print(f'Flight Radar running at http://127.0.0.1:{port}',flush=True)
+        try:server.serve_forever()
+        except KeyboardInterrupt:print('\n机票雷达已停止。',flush=True)
+    return 0
+
 if __name__=='__main__':
-    init(); install_provider_presets(); threading.Thread(target=scheduler,daemon=True).start()
-    port=int(os.environ.get('PORT','8765'))
-    print(f'Flight Radar running at http://127.0.0.1:{port}',flush=True)
-    ThreadingHTTPServer(('127.0.0.1',port),Handler).serve_forever()
+    raise SystemExit(main())

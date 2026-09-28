@@ -8,10 +8,17 @@ import urllib.request
 from datetime import date, timedelta
 from pathlib import Path
 from engine import AIRPORTS
+from airports import local_time, scope
 
 ROOT = Path(__file__).resolve().parent
 FLYAI_CLI = ROOT / 'node_modules/@fly-ai/flyai-cli/dist/flyai-bundle.cjs'
 CATALOG = [
+    dict(id='tongcheng', name='同程旅行 · 公开航班页', kind='tongcheng', website='https://www.ly.com/flights/home',
+         docs='https://www.ly.com/robots.txt', status='已接入公开页面',
+         note='无需密钥，使用本机 Edge 查询直飞航班、时间与展示价。每站至少间隔 120 秒，缓存 15 分钟；税费未确认不提醒。'),
+    dict(id='spring', name='春秋航空 · 低价日历', kind='spring', website='https://flights.ch.com/',
+         docs='https://flights.ch.com/robots.txt', status='试验接入 · 默认停用',
+         note='初次查询成功，但后续日历请求返回非 JSON 页面，暂默认停用。可手动测试；仅提供航线起价，不参与逐航班比价或邮件提醒。'),
     dict(id='fliggy', name='飞猪 FlyAI', kind='flyai', website='https://flyai.open.fliggy.com/',
          docs='https://github.com/alibaba-flyai/flyai-skill', status='已实现查询适配器',
          note='支持官方体验查询；正式 API Key 可在控制台申请。结果数量受限，费用口径未确认的报价不触发提醒。'),
@@ -33,7 +40,7 @@ CATALOG = [
 ]
 
 def presets():
-    return [dict(catalog_id=c['id'],name=c['name'],kind=c['kind'],endpoint='',token='',enabled=c['kind']=='flyai') for c in CATALOG]
+    return [dict(catalog_id=c['id'],name=c['name'],kind=c['kind'],endpoint='',token='',enabled=c['kind'] in ('flyai','tongcheng')) for c in CATALOG]
 
 def parse_flyai(payload, monitor):
     if payload.get('status') not in (0, '0') or not isinstance(payload.get('data',{}).get('itemList'),list):
@@ -46,16 +53,14 @@ def parse_flyai(payload, monitor):
             segments=[]
             for s in journeys[0]['segments']:
                 origin=s['depStationCode']; dest=s['arrStationCode']
-                # Official output gives local times without timezone. Only map known mainland airports.
-                if origin not in AIRPORTS or dest not in AIRPORTS: raise ValueError('unsupported timezone')
                 if s.get('stopInfos'): raise ValueError('unmapped technical stop')
                 flight=s['marketingTransportNo']
                 if not re.fullmatch(r'[A-Z0-9]{2}\d{2,5}',flight): raise ValueError('invalid flight')
                 segments.append(dict(origin=origin,destination=dest,
-                    departure=s['depDateTime'].replace(' ','T')+'+08:00',
-                    arrival=s['arrDateTime'].replace(' ','T')+'+08:00',flight=flight,carrier=flight[:2]))
+                    departure=local_time(s['depDateTime'],origin),
+                    arrival=local_time(s['arrDateTime'],dest),flight=flight,carrier=flight[:2],airline=s.get('marketingTransportName','')))
             if not segments or len(segments)>2: continue
-            if segments[0]['origin']!=monitor['origin'] or segments[-1]['destination']!=monitor['destination']: continue
+            if segments[0]['origin'] not in scope(monitor,'origin') or segments[-1]['destination'] not in scope(monitor,'destination'): continue
             if not monitor['date_from']<=segments[0]['departure'][:10]<=monitor['date_to']: continue
             price=item.get('ticketPrice',item.get('adultPrice'))
             if price is None: continue
@@ -117,14 +122,27 @@ def generic(provider, monitor):
 
 def search(provider, monitor):
     kind=provider.get('kind','generic')
-    if kind=='flyai': return flyai(provider,monitor)
+    if kind in ('tongcheng','spring'):
+        from crawlers import search_pages
+        return search_pages(provider,monitor)
     if kind=='partner': raise ValueError('此来源尚待平台授权及协议适配，未启用实时查询')
-    if kind!='generic': raise ValueError('未知接口类型')
-    return generic(provider,monitor),[]
+    if kind not in ['generic','flyai']: raise ValueError('未知接口类型')
+    output=[];hints=[];failures=[]
+    for origin in scope(monitor,'origin'):
+        for dest in scope(monitor,'destination'):
+            query={**monitor,'origin':origin,'destination':dest,'origin_airports':[origin],'destination_airports':[dest]}
+            try:
+                values,notes=flyai(provider,query) if kind=='flyai' else (generic(provider,query),[])
+                output.extend(values);hints.extend(notes)
+            except Exception as e:
+                failures.append(f'{origin} → {dest}：'+(str(e) if isinstance(e,ValueError) else type(e).__name__))
+    if failures and not output:raise ValueError('；'.join(failures[:5]))
+    hints.extend('部分机场查询失败：'+f for f in failures)
+    return output,sorted(set(hints))
 
 def validate_provider(p, old):
     kind=p.get('kind','generic'); p['kind']=kind
-    if kind not in ['flyai','generic','partner']: raise ValueError('未知接口类型')
+    if kind not in ['flyai','generic','partner','tongcheng','spring']: raise ValueError('未知接口类型')
     if kind=='partner' and p.get('enabled'): raise ValueError(p['name']+' 尚未完成授权及协议适配，不能启用')
     if kind=='generic' and not p.get('endpoint','').startswith('https://'): raise ValueError('接口地址须为 HTTPS')
     if kind!='generic': p['endpoint']=''

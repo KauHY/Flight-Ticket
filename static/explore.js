@@ -1,0 +1,45 @@
+let boardRows=[],boardMeta=null,boardPage=1,airportSequence=0;
+function readAirport(input){return input.dataset.code||input.value.trim()}
+function attachAirport(input){
+ const wrap=document.createElement('div');wrap.className='airport-picker';input.parentNode.insertBefore(wrap,input);wrap.append(input);
+ const list=document.createElement('div');list.className='airport-options';list.hidden=true;list.id='airport-options-'+(++airportSequence);list.setAttribute('role','listbox');wrap.append(list);
+ const note=document.createElement('small');note.className='airport-selection';wrap.append(note);
+ input.setAttribute('role','combobox');input.setAttribute('aria-autocomplete','list');input.setAttribute('aria-controls',list.id);input.setAttribute('aria-expanded','false');
+ let timer,seq=0,active=-1;
+ const close=()=>{seq++;clearTimeout(timer);list.hidden=true;input.setAttribute('aria-expanded','false');input.removeAttribute('aria-activedescendant');active=-1};
+ const choose=item=>{input.dataset.code=item.id;input.value=item.label;note.textContent=item.codes.join(' / ');close()};
+ const search=async()=>{const current=++seq;if(!input.value.trim()){close();return}try{const r=await api('airports?q='+encodeURIComponent(input.value));if(current!==seq)return;list.innerHTML='';active=-1;r.items.filter(x=>x.selectable).slice(0,18).forEach((item,i)=>{const b=document.createElement('button');b.type='button';b.setAttribute('role','option');b.id=list.id+'-'+i;b.innerHTML=`<strong>${esc(item.label)}</strong><small>${esc(item.kind==='city'?'城市全部机场':item.city||item.name)} · ${esc(item.country)} · ${esc(item.codes.join(' / '))}</small>`;b.onmousedown=e=>e.preventDefault();b.onclick=()=>choose(item);list.append(b)});if(!list.children.length)list.innerHTML='<p>未找到可选机场，请尝试英文或三字码。</p>';list.hidden=false;input.setAttribute('aria-expanded','true')}catch(e){note.textContent=e.message}};
+ input.addEventListener('input',()=>{seq++;delete input.dataset.code;note.textContent='';clearTimeout(timer);timer=setTimeout(search,180)});
+ input.addEventListener('focus',()=>{if(!input.dataset.code&&input.value)search()});
+ input.addEventListener('blur',close);
+ input.addEventListener('keydown',e=>{const items=[...list.querySelectorAll('button')];if(e.key==='Escape'){close();return}if(list.hidden||!items.length)return;if(e.key==='ArrowDown'||e.key==='ArrowUp'){e.preventDefault();active=(active+(e.key==='ArrowDown'?1:-1)+items.length)%items.length;items.forEach((b,i)=>b.setAttribute('aria-selected',i===active?'true':'false'));input.setAttribute('aria-activedescendant',items[active].id);items[active].scrollIntoView({block:'nearest'})}else if(e.key==='Enter'&&active>=0){e.preventDefault();items[active].click()}});
+ input.form?.addEventListener('reset',()=>{delete input.dataset.code;note.textContent='';close()});
+}
+document.querySelectorAll('[data-airport]').forEach(attachAirport);
+function timeLabel(s){return s.slice(11,16)}
+function dateLabel(s){return s.slice(0,10)}
+function priceCell(row){return `${row.total!=null?`<strong>${yuan(row.total)}</strong><small class="verified-price">最低含税价</small>`:'<span class="muted">含税价待确认</span>'}${row.display_price!=null?`<small>最低展示价 ${yuan(row.display_price)} · 费用未确认</small>`:''}`}
+function drawBoard(){
+ const result=$('#flight-results');if(!boardMeta){result.innerHTML='';return}
+ result.innerHTML=`<div class="panel"><div class="section-head"><h2>各航班最低报价 <span class="badge">${boardRows.length} 个航班</span></h2><span>查询时间 ${when(boardMeta.checked)}</span></div>${boardMeta.demo?'<p class="warning">演示数据 · 非真实航班或票价</p>':''}<p class="hint">${esc(boardMeta.coverage||'仅覆盖本轮来源返回的航班。')} 含税价与展示价分别取最低值，不能直接混排比较；起降时间为机场当地时间。代码共享按展示航班号分别列出。</p>${(boardMeta.warnings||[]).map(x=>`<p class="warning">${esc(x)}</p>`).join('')}<div class="board-controls"><label>航司<select id="board-airline"><option value="">全部航司</option>${[...new Set(boardRows.map(r=>r.airline))].sort().map(a=>`<option>${esc(a)}</option>`).join('')}</select></label><label>排序<select id="board-sort"><option value="price">含税价优先，再按价格</option><option value="time">出发日期 / 时间</option><option value="flight">航班号</option></select></label><label>筛选航班<input id="board-filter" placeholder="航班号或机场代码"></label></div><div id="board-table"></div><div class="pagination"><button type="button" id="board-prev" class="secondary">上一页</button><span id="board-page"></span><button type="button" id="board-next" class="secondary">下一页</button></div>${(boardMeta.hints||[]).map(x=>`<p class="hint">平台提示：${esc(x)}</p>`).join('')}</div>`;
+ ['#board-airline','#board-sort','#board-filter'].forEach(id=>$(id).addEventListener(id==='#board-filter'?'input':'change',()=>{boardPage=1;drawRows()}));
+ $('#board-prev').onclick=()=>{boardPage--;drawRows()};$('#board-next').onclick=()=>{boardPage++;drawRows()};drawRows();
+}
+function drawRows(){
+ const airline=$('#board-airline').value,q=$('#board-filter').value.toUpperCase().trim(),sort=$('#board-sort').value;
+ let rows=boardRows.filter(r=>(!airline||r.airline===airline)&&(!q||[r.flight,r.origin,r.destination].some(x=>x.toUpperCase().includes(q))));
+ rows.sort((a,b)=>sort==='time'?a.departure.localeCompare(b.departure):sort==='flight'?a.flight.localeCompare(b.flight):(Number(a.total==null)-Number(b.total==null))||((a.total??a.display_price)-(b.total??b.display_price))||a.departure.localeCompare(b.departure));
+ const pages=Math.max(1,Math.ceil(rows.length/20));boardPage=Math.min(pages,Math.max(1,boardPage));
+ $('#board-page').textContent=`${rows.length} 个航班 · 第 ${boardPage} / ${pages} 页`;$('#board-prev').disabled=boardPage===1;$('#board-next').disabled=boardPage===pages;
+ $('#board-table').innerHTML=rows.length?`<div class="table-scroll"><table class="flight-table"><thead><tr><th>航司 / 航班</th><th>起飞</th><th>到达</th><th>最低票价</th><th>报价来源</th></tr></thead><tbody>${rows.slice((boardPage-1)*20,boardPage*20).map(r=>`<tr><td><strong>${esc(r.airline)}</strong><small>${esc(r.flight)}</small></td><td><strong>${esc(timeLabel(r.departure))}</strong><small>${esc(dateLabel(r.departure))} · ${esc(r.origin)}<br>UTC${esc(r.departure.slice(-6))}</small></td><td><strong>${esc(timeLabel(r.arrival))}</strong><small>${esc(dateLabel(r.arrival))} · ${esc(r.destination)}<br>UTC${esc(r.arrival.slice(-6))}</small></td><td class="flight-price">${priceCell(r)}</td><td><details><summary>${r.sources.length} 个来源 · ${r.quote_count} 个报价</summary>${r.quotes.map(o=>`<p>${esc(o.source)} · ${yuan(o.price)}<br>${o.verified?'含税总价':'展示价，费用未确认'} ${/^https:\/\//.test(o.url)?`<a href="${esc(o.url)}" target="_blank" rel="noopener noreferrer">查看 ↗</a>`:''}</p>`).join('')}</details></td></tr>`).join('')}</tbody></table></div>`:'<div class="empty"><h2>暂无匹配航班</h2><p>可调整筛选、日期或机场。没有报价不代表该航线没有航班。</p></div>';
+}
+function showMonitorFlights(id){const m=state.monitors.find(x=>x.id===id);if(!m)return;switchTab('flights');boardRows=m.result?.flights||[];boardMeta=m.result||{checked:m.checked,warnings:[],hints:[]};boardPage=1;$('#flight-status').textContent=`${m.origin_label||m.origin} → ${m.destination_label||m.destination} · 最近一次监控结果${m.result?.flights?'':'（需重新检查监控以生成逐航班列表）'}`;drawBoard()}
+$('#flight-form').onsubmit=async e=>{
+ e.preventDefault();const form=e.target,button=$('#flight-submit');const data=Object.fromEntries(new FormData(form));data.origin=readAirport(form.elements.origin);data.destination=readAirport(form.elements.destination);data.demo=form.elements.demo.checked;
+ button.disabled=true;$('#flight-status').textContent='正在查询各机场组合，请稍候…';boardMeta=null;drawBoard();
+ try{const job=await api('flights',data);let result;for(;;){await new Promise(r=>setTimeout(r,1000));result=await api('flights/'+job.id);if(result.status!=='running')break}if(result.status==='error')throw Error(result.error);boardRows=result.result.flights;boardMeta=result.result;boardPage=1;$('#flight-status').textContent=`${result.route.origin_label} → ${result.route.destination_label} · ${result.route.origin_airports.join('/')} → ${result.route.destination_airports.join('/')} · 查询完成`;drawBoard()}catch(err){$('#flight-status').textContent=err.message}finally{button.disabled=false}
+};
+let directorySeq=0,directoryTimer;
+async function loadDirectory(){const seq=++directorySeq;try{const r=await api('airports?all=1&q='+encodeURIComponent($('#directory-search').value));if(seq!==directorySeq)return;$('#directory-stats').textContent=`${r.stats.total.toLocaleString()} 条机场记录 · ${r.stats.countries} 个国家和地区 · ${r.stats.selectable.toLocaleString()} 个 IATA 机场 · ${r.stats.cities} 个多机场城市分组`;$('#directory-results').innerHTML=r.items.length?r.items.map(a=>`<div class="directory-row"><div><strong>${esc(a.label)}</strong><p>${esc(a.kind==='city'?'城市分组':a.name)} · ${esc(a.city||'')} · ${esc(a.country)}</p></div><div><span class="badge">${esc(a.codes.join(' / ')||a.icao)}</span><small>${esc(a.timezone||'')}${!a.selectable?' · 无 IATA，不可查价':''}</small></div></div>`).join(''):'<p>没有匹配结果，请尝试其他名称或代码。</p>'}catch(e){$('#directory-stats').textContent=e.message}}
+$('#directory-search').oninput=()=>{clearTimeout(directoryTimer);directoryTimer=setTimeout(loadDirectory,200)};
+loadDirectory();
